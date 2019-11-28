@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+
+from typing import Dict
+
+import os
+import sys
+
+import argparse
+import argcomplete
+
+import json
+import jinja2
+
+import gnupg
+import gnupg._parsers
+import subprocess
+
+# Yeah, well.
+if "DECRYPTION_COMPLIANCE_MODE" not in gnupg._parsers.Verify.TRUST_LEVELS:
+    gnupg._parsers.Verify.TRUST_LEVELS["DECRYPTION_COMPLIANCE_MODE"] = 23
+
+SYNOPSIS = """
+PyCrumbs is a command-line utility for the shell, for storing commands under a
+meaningful name. Commands can be encrypted using a symmetric key (via GPG) for
+a measure of security.
+"""
+
+DESCRIPTION = """
+PyCrumbs uses Jinja2 to render commands. This means that commands can use
+templates functions to render the command before executing. The environment
+includes the following definitions:
+
+    {{argc}}          The number of arguments
+    {{args[n]}}       The argument (n start from 0)
+    {{name}}          The name of the crumb
+    {{combined}}      Combined quoted argument list
+
+Extra filter functions are provided in the Jinja2 environment:
+
+    {{expr|quote}}    Will wrap the expression in quotes ('"')
+"""
+
+parser = argparse.ArgumentParser(
+    description=SYNOPSIS, epilog=DESCRIPTION,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("-v", "--verbose", action="store_true",
+                    help="Display verbose information")
+parser.add_argument("-c", "--config", metavar="FILE",
+                    help="Specify the configuration file")
+subparser = parser.add_subparsers(
+    title="Command", dest="command", metavar="COMMAND", description="Operation to perform")
+
+parser_list = subparser.add_parser("list", help="List the current crumbs")
+parser_list.add_argument("-d", "--detailed", action="store_true",
+                         help="Display detailed list")
+
+parser_insert = subparser.add_parser("insert", help="Add a new crumb")
+parser_insert.add_argument("-e", "--encrypt", action="store_true",
+                           help="Encrypt the crumb")
+parser_insert.add_argument(
+    "name", type=str, metavar="NAME", help="The name of the crumb to insert")
+parser_insert.add_argument(
+    "cmdline", type=str, metavar="CMDLINE", help="The command-line for the new crumb")
+
+parser_show = subparser.add_parser("show", help="Show a crumb")
+parser_show.add_argument("name", type=str, metavar="NAME",
+                         help="The name of the crumb to show")
+
+parser_exec = subparser.add_parser("exec", help="Execute a crumb")
+parser_exec.add_argument("name", type=str, metavar="NAME",
+                         help="The name of the crumb to execute")
+parser_exec.add_argument("args", metavar="ARG", nargs="*",
+                         help="Argument to pass to the command")
+
+parser_edit = subparser.add_parser("edit", help="Edit a crumb")
+parser_edit.add_argument("name", type=str, metavar="NAME",
+                         help="The name of the crumb to edit")
+
+parser_delete = subparser.add_parser("delete", help="Delete a crumb")
+parser_delete.add_argument("name", type=str, metavar="NAME",
+                           help="The name of the crumb to delete")
+
+parser_encrypt = subparser.add_parser("encrypt", help="Encrypt a crumb")
+parser_encrypt.add_argument("name", type=str, metavar="NAME",
+                            help="The name of the crumb to encrypt")
+
+parser_decrypt = subparser.add_parser("decrypt", help="Decrypt a crumb")
+parser_decrypt.add_argument("name", type=str, metavar="NAME",
+                            help="The name of the crumb to decrypt")
+
+argcomplete.autocomplete(parser)
+args = parser.parse_args()
+
+gpg = gnupg.GPG()
+
+
+def verbose(*argv) -> None:
+    if args.verbose:
+        sys.stdout.write(*argv)
+        sys.stdout.write('\n')
+
+
+if not args.command:
+    sys.stderr.write("Missing action\n")
+    sys.exit(1)
+
+
+def get_crumbs_path() -> str:
+    if args.config:
+        verbose(f"Using configuration file from arguments: {args.config}")
+        return args.config
+    return os.path.join(os.environ["HOME"], ".crumbs")
+
+
+def quote(str):
+    return '"' + str.translate(str.maketrans({'"': r'\"'})) + '"'
+
+
+class Crumb:
+    def __init__(self, name: str, command: str, encrypted: bool):
+        self.name: str = name
+        self.command: str = command
+        self.encrypted: bool = encrypted
+
+    def canonical(self) -> Dict[str, str]:
+        return {
+            "command": self.command,
+            "encrypted": self.encrypted
+        }
+
+    @staticmethod
+    def from_canonical(name: str, obj: Dict[str, str]):
+        return Crumb(name, obj["command"], obj["encrypted"])
+
+    def get_command(self) -> str:
+        if self.encrypted:
+            res = gpg.decrypt(self.command)
+            assert res.ok, res.status
+            return str(res)
+        else:
+            return self.command
+
+    def set_command(self, command: str) -> None:
+        if self.encrypted:
+            res = gpg.encrypt(command, symmetric="AES256", encrypt=False)
+            self.command = str(res)
+        else:
+            self.command = command
+
+    def encrypt(self) -> None:
+        assert not self.encrypted, "Crumb is already encrypted"
+        res = gpg.encrypt(self.command, symmetric="AES256", encrypt=False)
+        assert res.ok, res.status
+        self.command = str(res)
+        self.encrypted = True
+
+    def decrypt(self) -> None:
+        assert self.encrypted, "Crumb is not encrypted"
+        res = gpg.decrypt(self.command)
+        assert res.ok, res.status
+        self.command = str(res)
+        self.encrypted = False
+
+    def render(self) -> str:
+        env = jinja2.Environment()
+        env.filters["quote"] = quote
+        template = env.from_string(self.get_command())
+        return template.render({
+            "argc": len(args.args),
+            "args": args.args,
+            "name": args.name,
+            "combined": ' '.join([quote(arg) for arg in args.args])
+        })
+
+    def edit(self, editor: str):
+        tmp = os.path.join(os.environ["HOME"], self.name.replace(
+            os.path.sep, '-') + ".command")
+        with open(tmp, "wt") as fp:
+            fp.write(self.get_command())
+        res = os.system(f"{editor} \"{tmp}\"")
+        if res == 0:
+            with open(tmp, "rt") as fp:
+                self.set_command(fp.read())
+        os.remove(tmp)
+        return res == 0
+
+
+class Crumbs:
+    def __init__(self):
+        self.crumbs: Dict[str, Crumb] = {}
+
+    def insert(self, name: str, encrypted: bool, cmdline: str) -> Crumb:
+        crumb = Crumb(name, "", encrypted)
+        crumb.set_command(cmdline)
+        self.crumbs[name] = crumb
+        return crumb
+
+    def has(self, name: str) -> bool:
+        return name in self.crumbs
+
+    def get(self, name: str) -> Crumb:
+        return self.crumbs.get(name, None)
+
+    def remove(self, name: str):
+        self.crumbs.pop(name)
+
+    def load(self):
+        path = Crumbs.get_crumbs_path()
+        objs = {}
+        if os.path.isfile(path):
+            verbose(f"Loading crumbs: {path}")
+            with open(path, "rt") as fp:
+                objs = json.load(fp)
+        else:
+            verbose("Crumbs file does not exist")
+
+        for key in objs:
+            self.crumbs[key] = Crumb.from_canonical(key, objs[key])
+
+    def save(self):
+        path = Crumbs.get_crumbs_path()
+        objs = {}
+        for key in self.crumbs:
+            objs[key] = self.crumbs[key].canonical()
+        verbose(f"Saving crumbs file: {path}")
+        with open(path, "wt") as fp:
+            json.dump(objs, fp)
+
+    @staticmethod
+    def get_crumbs_path():
+        if args.config:
+            verbose(f"Using configuration file from arguments: {args.config}")
+            return args.config
+        return os.path.join(os.environ["HOME"], ".crumbs")
+
+
+crumbs = Crumbs()
+crumbs.load()
+
+if args.command == "list":
+    if args.detailed:
+        for key in crumbs.crumbs:
+            crumb = crumbs.crumbs[key]
+            print(f"'{key}':")
+            if crumb.encrypted:
+                print("  <encrypted>\n")
+            else:
+                print("  " + crumb.command, '\n')
+    else:
+        for key in crumbs.crumbs:
+            print(key)
+elif args.command == "insert":
+    if crumbs.has(args.name):
+        sys.stderr.write(f"Crumb '{args.name}' already exists\n")
+        sys.exit(1)
+    crumbs.insert(args.name, args.encrypt, args.cmdline)
+    crumbs.save()
+elif args.command == "show":
+    crumb = crumbs.get(args.name)
+    if crumb:
+        print(crumb.get_command())
+    else:
+        sys.stderr.write(f"Crumb '{args.name}' does not exist\n")
+        sys.exit(1)
+elif args.command == "exec":
+    crumb = crumbs.get(args.name)
+    if crumb:
+        verbose(f"Executing crumb '{args.name}'")
+        command = crumb.render()
+        verbose(f"Command: {command}")
+        sys.exit(os.system(command))
+    else:
+        sys.stderr.write(f"Crumb '{args.name}' does not exist\n")
+        sys.exit(1)
+elif args.command == "edit":
+    if "EDITOR" not in os.environ:
+        sys.stderr.write(
+            f"Unable to determine editor. Define 'EDITOR' environment\n")
+        sys.exit(1)
+    editor = os.environ["EDITOR"]
+    verbose(f"Editor determined as: {editor}")
+    crumb = crumbs.get(args.name)
+    if not crumb:
+        sys.stderr.write(f"WARNING: Crumb '{args.name}' does not exist\n")
+        crumb = crumbs.insert(args.name, False, "")
+    res = crumb.edit(editor)
+    if res:
+        crumbs.save()
+elif args.command == "delete":
+    if crumbs.has(args.name):
+        crumbs.remove(args.name)
+        crumbs.save()
+    else:
+        sys.stderr.write(f"Crumb '{args.name}' does not exist\n")
+        sys.exit(1)
+elif args.command == "encrypt":
+    crumb = crumbs.get(args.name)
+    if crumb:
+        if crumb.encrypted:
+            sys.stderr.write(f"Crumb '{args.name}' is already encrypted\n")
+            sys.exit(1)
+        crumb.encrypt()
+        crumbs.save()
+    else:
+        sys.stderr.write(f"Crumb '{args.name}' does not exist\n")
+        sys.exit(1)
+elif args.command == "decrypt":
+    crumb = crumbs.get(args.name)
+    if crumb:
+        if not crumb.encrypted:
+            sys.stderr.write(f"Crumb '{args.name}' is not encrypted\n")
+            sys.exit(1)
+        crumb.decrypt()
+        crumbs.save()
+    else:
+        sys.stderr.write(f"Crumb '{args.name}' does not exist\n")
+        sys.exit(1)
+else:
+    sys.stderr.write(f"Unrecognized command: {args.command}\n")
+    sys.exit(1)
