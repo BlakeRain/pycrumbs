@@ -9,8 +9,8 @@ import sys
 import argparse
 import argcomplete
 
-import json
 import jinja2
+import yaml
 
 import gnupg
 import gnupg._parsers
@@ -211,7 +211,7 @@ class Crumbs:
         if os.path.isfile(path):
             verbose(f"Loading crumbs: {path}")
             with open(path, "rt") as fp:
-                objs = json.load(fp)
+                objs = yaml.load(fp, Loader=yaml.FullLoader)
         else:
             verbose("Crumbs file does not exist")
 
@@ -225,7 +225,7 @@ class Crumbs:
             objs[key] = self.crumbs[key].canonical()
         verbose(f"Saving crumbs file: {path}")
         with open(path, "wt") as fp:
-            json.dump(objs, fp)
+            yaml.dump(objs, fp, width=None)
 
     @staticmethod
     def get_crumbs_path():

@@ -14,6 +14,6 @@ setuptools.setup(
     url="https://github.com/BlakeRain/pycrymbs",
     packages=setuptools.find_packages(),
     scripts=["bin/pycrumbs"],
-    install_requires=["argcomplete", "jinja2"],
+    install_requires=["argcomplete", "jinja2", "Pyyaml"],
     classifiers=[]
 )
