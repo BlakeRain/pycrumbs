@@ -92,7 +92,7 @@ parser_decrypt.add_argument("name", type=str, metavar="NAME",
 argcomplete.autocomplete(parser)
 args = parser.parse_args()
 
-gpg = gnupg.GPG()
+gpg = gnupg.GPG(binary="/opt/homebrew/bin/gpg")
 
 
 def verbose(*argv) -> None:
